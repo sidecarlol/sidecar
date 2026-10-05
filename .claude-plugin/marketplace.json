@@ -1,0 +1,11 @@
+{
+  "name": "sidecar",
+  "owner": { "name": "Sidecar" },
+  "plugins": [
+    {
+      "name": "sidecar",
+      "source": "./mod/sidecar",
+      "description": "Sponsored spinner line + video ad pane while Claude works. You keep 50% of each qualified impression."
+    }
+  ]
+}
