@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { LastView, Phase, ServedAd, Wallet } from '../types'
+import { cleanAd, cleanUrl, cleanWallet } from './text'
 import { decodePack, fitGrid, frameCells, frameRgba, solidCells } from './video'
 import type { FramePack } from './video'
 
@@ -34,6 +35,20 @@ const BAR_COLOR = '#d97757'
 const LINK_HOVER = { backgroundColor: BAR_COLOR }
 /** Cells the pane's close mark covers at the right end of the body's first row. */
 const CLOSE_MARK_COLUMNS = 2
+/** A call to the ad server that has not answered by now is given up on: a hung server must not pile up work. */
+const API_TIMEOUT_MS = 8000
+/** Frame packs are megabytes: a slow link gets longer. */
+const DOWNLOAD_TIMEOUT_MS = 30_000
+/** After a failed registration the next attempt waits this long, so a down server or a spent install limit is not asked every turn. */
+const REGISTER_RETRY_MS = 5 * 60_000
+const REGISTER_LIMITED_RETRY_MS = 60 * 60_000
+/**
+ * The engine draws the elapsed time, tokens and effort after the spinner's message
+ * (`(1m 12s · ↓ 12.3k tokens)`) and the glyph before it: this many columns are not ours.
+ */
+const SPINNER_CHROME_COLUMNS = 36
+const SPINNER_MIN_MESSAGE = 24
+const SPONSORED_TAG = ' · Sponsored'
 
 const ad = atom({ plugin: 'sidecar', key: 'ad' } as const, null)
 const wallet = atom({ plugin: 'sidecar', key: 'wallet' } as const, null)
@@ -68,6 +83,10 @@ const play = {
   hdPending: null as { creativeId: string; url: string } | null,
   /** An Image swap went through: this terminal draws real pixels. */
   isImageConfirmed: false,
+  /** The JPEG frames for the Claude desktop app, which draws them in an Svg. */
+  desktop: null as DesktopPack | null,
+  /** Where the pane draws: the session's surface at start, then the pane's own. */
+  surface: null as string | null,
   frame: 0,
   grid: { columns: 48, rows: 14 },
   frameTimer: undefined as Timer,
@@ -88,6 +107,9 @@ const play = {
   lastActiveAt: 0,
   /** The pane was drawn inline in a terminal wide enough to dock it in fullscreen. */
   couldDock: false,
+  /** No registration is attempted before this clock time (a failure, or the network's install limit). */
+  registerRetryAt: 0,
+  registering: null as Promise<boolean> | null,
 }
 
 /** Cents from a cent up; a single view's fraction of a cent keeps four places. */
@@ -105,6 +127,17 @@ function usdCents(micros: number): string {
 /** What the viewer gets for this ad: a share, or nothing for Sidecar's own house ad. */
 function earnText(current: ServedAd, suffix: string): string {
   return current.isHouse ? 'House ad, not paid' : `you earn ${usd(current.viewerMicros)}${suffix}`
+}
+
+/**
+ * The spinner's line: the ad, then the Sponsored mark. An ad line can be 60 characters, more than the
+ * row holds at 80 columns beside the time and tokens, and a wrapped spinner jumps the prompt around:
+ * cut the ad's text to fit, never the mark.
+ */
+function spinnerMessage(text: string, columns?: number): string {
+  const room = columns ? Math.max(SPINNER_MIN_MESSAGE, columns - SPINNER_CHROME_COLUMNS) - SPONSORED_TAG.length : text.length
+  const line = text.length > room ? `${text.slice(0, Math.max(1, room - 1)).trimEnd()}…` : text
+  return `${line}${SPONSORED_TAG}`
 }
 
 function clockText(ms: number): string {
@@ -132,50 +165,97 @@ async function configure($: EngineInterface) {
   play.wantsPixels = (await $.store.get('videoQuality')) !== 'blocks'
 }
 
+/** A fetch that gives up after `ms`: the host's own fetch has no timeout, and a hung server must not hold a hook or pile up beats. */
+async function fetchWithin($: EngineInterface, url: string, init: Parameters<EngineInterface['http']['fetch']>[1], ms: number) {
+  let timer: Timer
+  const timeout = new Promise<never>((_, reject) => {
+    timer = $.clock.after(ms, () => reject(new Error(`sidecar: no answer in ${Math.round(ms / 1000)}s`))) as Timer
+  })
+  try {
+    return await Promise.race([$.http.fetch(url, init), timeout])
+  } finally {
+    stopTimer(timer)
+  }
+}
+
+/** Runs a timer's work so a throw never escapes into the host (a rejection from a 100ms tick would repeat 10 times a second). */
+function guarded(work: () => Promise<unknown>) {
+  return async () => {
+    try {
+      await work()
+    } catch {
+      // The next tick or beat tries again.
+    }
+  }
+}
+
 async function api($: EngineInterface, path: string, body?: unknown, retried = false): Promise<unknown> {
   await configure($)
   const token = (await $.store.get('token')) as string | undefined
-  const res = await $.http.fetch(`${play.apiBase}/api/v1${path}`, {
-    method: body === undefined ? 'GET' : 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
+  const res = await fetchWithin(
+    $,
+    `${play.apiBase}/api/v1${path}`,
+    {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
+    API_TIMEOUT_MS,
+  )
   // The server no longer knows this device (new database, revoked token, a different apiBase):
   // forget the token, register again, and retry once.
   if (res.status === 401 && token && path !== '/devices' && !retried) {
     await $.store.set('token', '')
     if (await ensureDevice($)) return api($, path, body, true)
   }
-  if (!res.ok) throw new Error(`sidecar ${path}: HTTP ${res.status}`)
+  if (!res.ok) throw Object.assign(new Error(`sidecar ${path}: HTTP ${res.status}`), { status: res.status })
   return JSON.parse(res.text) as unknown
 }
 
 async function refreshWallet($: EngineInterface): Promise<Wallet | null> {
   try {
     const got = (await api($, '/me')) as { wallet: Wallet }
-    await update($, wallet, () => got.wallet)
-    return got.wallet
+    const safe = cleanWallet(got.wallet, play.apiBase)
+    await update($, wallet, () => safe)
+    return safe
   } catch {
     return null
   }
 }
 
-async function ensureDevice($: EngineInterface): Promise<boolean> {
+/** One registration at a time: the start-up one and a first prompt's must not both spend an install. */
+function ensureDevice($: EngineInterface): Promise<boolean> {
+  play.registering ??= registerDevice($).finally(() => {
+    play.registering = null
+  })
+  return play.registering
+}
+
+async function registerDevice($: EngineInterface): Promise<boolean> {
   if (await $.store.get('token')) return true
+  // A failed registration is not repeated every turn: a down server or a spent install limit would be asked again and again.
+  if ((await $.clock.now()) < play.registerRetryAt) return false
   try {
     const version = await $.session.version()
     const made = (await api($, '/devices', { client: 'claude-code', version: version.version })) as {
-      token: string
-      deviceId: string
+      token?: unknown
+      deviceId?: unknown
     }
+    // A captive portal or proxy can answer 200 with something else: only a real token counts.
+    if (typeof made.token !== 'string' || !made.token) throw new Error('sidecar /devices: no token')
     await $.store.set('token', made.token)
-    await $.store.set('deviceId', made.deviceId)
+    if (typeof made.deviceId === 'string') await $.store.set('deviceId', made.deviceId)
+    play.registerRetryAt = 0
     return true
-  } catch {
-    await update($, notice, () => 'Ad server unreachable; ads are off for now.')
+  } catch (error) {
+    const isLimited = (error as { status?: number }).status === 429
+    play.registerRetryAt = (await $.clock.now()) + (isLimited ? REGISTER_LIMITED_RETRY_MS : REGISTER_RETRY_MS)
+    await update($, notice, () =>
+      isLimited ? 'Too many new installs from this network today; ads are off until tomorrow.' : 'Ad server unreachable; ads are off for now.',
+    )
     return false
   }
 }
@@ -190,7 +270,7 @@ function cachePath(creativeId: string, kind = 'blocks'): string {
 async function cachePack($: EngineInterface, creativeId: string, url: string, kind = 'blocks'): Promise<string | null> {
   const path = cachePath(creativeId, kind)
   if (play.cacheDir && (await $.fs.exists(path))) return $.fs.read(path)
-  const res = await $.http.fetch(url)
+  const res = await fetchWithin($, url, undefined, DOWNLOAD_TIMEOUT_MS)
   if (!res.ok) return null
   if (play.cacheDir) await $.fs.write(path, res.text)
   return res.text
@@ -228,6 +308,57 @@ function wantsImage(): boolean {
   return play.wantsPixels && !play.isImageRefused
 }
 
+type DesktopPack = { fps: number; count: number; jpeg: string[] }
+
+/** The most frames and parts a desktop pack may have. */
+const DESKTOP_MAX_FRAMES = 300
+const DESKTOP_MAX_PARTS = 20
+/** The most characters one frame may add to an Svg, which holds 131,072. */
+const DESKTOP_MAX_FRAME_CHARS = 120_000
+/** Prefetch warms at most this many desktop packs per pass, to bound the download. */
+const DESKTOP_PREFETCH_PACKS = 3
+/** A frame is spliced into Svg markup, so only base64 JPEG may pass: nothing in it can close the attribute or add an element. */
+const JPEG_BASE64 = /^\/9j\/[A-Za-z0-9+/]*={0,2}$/
+
+/** Fetches a desktop pack: its index, then each part, joined back into one list of JPEG frames. */
+async function fetchDesktop($: EngineInterface, creativeId: string, url: string): Promise<DesktopPack | null> {
+  try {
+    const indexText = await cachePack($, creativeId, url, 'desktop')
+    if (!indexText) return null
+    const index = JSON.parse(indexText) as { fps?: number; count?: number; parts?: number[] }
+    if (!Array.isArray(index.parts) || index.parts.length === 0 || index.parts.length > DESKTOP_MAX_PARTS) return null
+    const jpeg: string[] = []
+    for (let i = 0; i < index.parts.length; i++) {
+      const sep = url.includes('?') ? '&' : '?'
+      const partText = await cachePack($, creativeId, `${url}${sep}part=${i}`, `desktop.${i}`)
+      if (!partText) return null
+      const part = JSON.parse(partText) as { start?: number; jpeg?: string[] }
+      if (part.start !== jpeg.length || !Array.isArray(part.jpeg)) return null
+      for (const frame of part.jpeg) {
+        if (typeof frame !== 'string' || frame.length > DESKTOP_MAX_FRAME_CHARS || !JPEG_BASE64.test(frame)) return null
+        jpeg.push(frame)
+      }
+      if (jpeg.length > DESKTOP_MAX_FRAMES) return null
+    }
+    if (jpeg.length !== index.count) return null
+    return { fps: index.fps ?? 10, count: jpeg.length, jpeg }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * True where the pane draws an Svg but no Image or Raster: the Claude desktop app.
+ * The desktop app attaches after session.start, which then reports no surface, so ask the session.
+ */
+async function isSvgSurface($: EngineInterface): Promise<boolean> {
+  if (!play.surface) {
+    const surfaces = await $.session.surfaces()
+    play.surface = surfaces.find((s) => s !== 'terminal') ?? surfaces[0] ?? null
+  }
+  return play.surface === 'desktop'
+}
+
 /** The current frame as an Image source: a sharp PNG when there is one, else the block pack's pixels. */
 function pictureSource(pack: FramePack) {
   if (play.hd) return { png: play.hd.png[play.frame % play.hd.count]! }
@@ -240,11 +371,17 @@ async function prefetch($: EngineInterface) {
   if (play.isPrefetching || play.isTurnRunning || !play.wantsPane) return
   play.isPrefetching = true
   try {
-    const live = (await api($, '/creatives/live')) as { creatives: { id: string; framesUrl: string; hdUrl?: string }[] }
+    const live = (await api($, '/creatives/live')) as { creatives: { id: string; framesUrl: string; hdUrl?: string; desktopUrl?: string }[] }
+    let desktopPacks = 0
     for (const c of live.creatives) {
       if (play.isTurnRunning) break
       await cachePack($, c.id, c.framesUrl).catch(() => null)
       if (wantsImage() && play.isImageConfirmed && c.hdUrl) await fetchHd($, c.id, c.hdUrl)
+      // A desktop pack is several MB: warm the first few (the highest bids), the rest download when they win.
+      if (c.desktopUrl && desktopPacks < DESKTOP_PREFETCH_PACKS && (await isSvgSurface($))) {
+        desktopPacks++
+        await fetchDesktop($, c.id, cleanUrl(c.desktopUrl))
+      }
     }
   } catch {
     // Offline: the next turn downloads what it wins.
@@ -332,6 +469,7 @@ async function endPlayback($: EngineInterface, reason: 'complete' | 'skipped' | 
   play.pack = null
   play.hd = null
   play.hdPending = null
+  play.desktop = null
   // Nothing left to show and Claude is done: give the screen back rather than an empty pane.
   if (!play.isTurnRunning) await closeOurPane($)
   if (!current || reason === 'expired') return
@@ -341,7 +479,8 @@ async function endPlayback($: EngineInterface, reason: 'complete' | 'skipped' | 
       reason,
       idleMs: idleMs(await $.clock.now()),
     })) as { creditedMicros: number; isCredited: boolean; wallet: Wallet }
-    await update($, wallet, () => done.wallet)
+    const safeWallet = cleanWallet(done.wallet, play.apiBase)
+    await update($, wallet, () => safeWallet)
     const view: LastView = {
       advertiser: current.advertiser,
       creditedMicros: done.creditedMicros,
@@ -384,7 +523,11 @@ async function tick($: EngineInterface) {
   }
   const at = await read($, phase)
   // Away, the picture holds its frame.
-  if (play.pack && play.isVideoMounted && (at === 'playing' || at === 'grace') && !(await read($, isAway))) {
+  if (play.desktop && play.isVideoMounted && (at === 'playing' || at === 'grace') && !(await read($, isAway))) {
+    // The desktop app has nothing to blit into: each frame is a redraw of the pane's Svg.
+    play.frame = (play.frame + 1) % play.desktop.count
+    $.ui.invalidate('ui.render')
+  } else if (play.pack && play.isVideoMounted && (at === 'playing' || at === 'grace') && !(await read($, isAway))) {
     play.frame = (play.frame + 1) % play.pack.count
     const size = { requestId: PANE, key: VIDEO, columns: play.grid.columns, rows: play.grid.rows }
     if (wantsImage()) {
@@ -414,9 +557,9 @@ async function tick($: EngineInterface) {
 
 function startPlaybackTimers($: EngineInterface) {
   stopPlaybackTimers()
-  const fps = play.pack?.fps ?? 4
-  play.frameTimer = $.clock.every(Math.round(1000 / fps), () => tick($)) as Timer
-  play.beatTimer = $.clock.every(BEAT_MS, () => beat($)) as Timer
+  const fps = play.desktop?.fps ?? play.pack?.fps ?? 4
+  play.frameTimer = $.clock.every(Math.round(1000 / fps), guarded(() => tick($))) as Timer
+  play.beatTimer = $.clock.every(BEAT_MS, guarded(() => beat($))) as Timer
 }
 
 /** The ad played out: settle it, then queue the next one if Claude is still working. */
@@ -424,7 +567,7 @@ async function finish($: EngineInterface) {
   await endPlayback($, 'complete')
   if (play.isTurnRunning) {
     play.showTimer = stopTimer(play.showTimer)
-    play.showTimer = $.clock.after(ROTATE_GAP_MS, () => onWorking($)) as Timer
+    play.showTimer = $.clock.after(ROTATE_GAP_MS, guarded(() => onWorking($))) as Timer
   } else {
     await closeOurPane($)
   }
@@ -442,10 +585,12 @@ async function startAd($: EngineInterface) {
       placements: canShowVideo ? ['spinner', 'pane'] : ['spinner'],
       idleMs: idleMs(await $.clock.now()),
     })) as { ad: ServedAd | null }
-    served = res.ad
+    served = res.ad ? cleanAd(res.ad, play.apiBase) : null
     await update($, notice, () => null)
-  } catch {
-    await update($, notice, () => 'Ad server unreachable; no ad this turn.')
+  } catch (error) {
+    // A device asking too fast is told to slow down: that is no outage, so no ad this turn and nothing said.
+    const isSlowedDown = (error as { status?: number }).status === 429
+    await update($, notice, () => (isSlowedDown ? null : 'Ad server unreachable; no ad this turn.'))
   }
   if (!served || !play.isTurnRunning) {
     // Nothing to show, or Claude finished while we asked: the impression settles unpaid on the server.
@@ -458,6 +603,7 @@ async function startAd($: EngineInterface) {
   play.pack = null
   play.hd = null
   play.hdPending = null
+  play.desktop = null
   play.lastTickAt = await $.clock.now()
   await update($, playedMs, () => 0)
   await update($, ad, () => served)
@@ -469,15 +615,18 @@ async function startAd($: EngineInterface) {
       if (text) play.pack = decodePack(text)
       // The sharp frames are bigger: the block pack starts the ad, and they take over once
       // the terminal has shown an image (a terminal without images never downloads them).
-      if (wantsImage() && served.hdUrl) {
+      if (served.desktopUrl && (await isSvgSurface($))) {
+        // The desktop app shows real frames in an Svg; the block pack is only for terminals.
+        play.desktop = await fetchDesktop($, served.creativeId, served.desktopUrl)
+      } else if (wantsImage() && served.hdUrl) {
         if (play.isImageConfirmed) void loadHd($, served.creativeId, served.hdUrl)
         else play.hdPending = { creativeId: served.creativeId, url: served.hdUrl }
       }
       $.ui.invalidate('ui.render')
     } catch {
       play.pack = null
-  play.hd = null
-  play.hdPending = null
+      play.hd = null
+      play.hdPending = null
     }
   } else {
     await closeOurPane($)
@@ -556,7 +705,7 @@ async function checkPresence($: EngineInterface): Promise<boolean> {
 }
 
 function ensurePresenceTimer($: EngineInterface) {
-  play.presenceTimer ??= $.clock.every(PRESENCE_CHECK_MS, () => checkPresence($)) as Timer
+  play.presenceTimer ??= $.clock.every(PRESENCE_CHECK_MS, guarded(() => checkPresence($))) as Timer
 }
 
 /** Whether a prompt or command came from the person rather than a schedule, a peer or code. */
@@ -581,6 +730,7 @@ export const register: Register = (on) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    play.surface = e.surface
     await $.command.register({
       name: 'sidecar',
       description: 'Sidecar ads: open the ad pane, or `pause`, `resume`, `link`, `wallet`, `pixels`, `blocks`',
@@ -591,9 +741,12 @@ export const register: Register = (on) => {
     $.ui.status(undefined)
     const home = await $.env.get('HOME')
     play.cacheDir = home ? `${home}/.cache/sidecar/frames` : ''
-    if (await ensureDevice($)) await refreshWallet($)
-    void prefetch($)
-    $.clock.every(PREFETCH_EVERY_MS, () => prefetch($))
+    // Nothing here waits on the network: a slow or hung server must never hold up the session starting.
+    void guarded(async () => {
+      if (await ensureDevice($)) await refreshWallet($)
+      await prefetch($)
+    })()
+    $.clock.every(PREFETCH_EVERY_MS, guarded(() => prefetch($)))
     ensurePresenceTimer($)
     return started
   })
@@ -653,7 +806,7 @@ export const register: Register = (on) => {
     // A video still in its grace window simply keeps playing into the new turn.
     if ((await read($, phase)) === 'grace') await setPhase($, 'playing')
     play.showTimer = stopTimer(play.showTimer)
-    play.showTimer = $.clock.after(SHOW_AFTER_MS, () => onWorking($)) as Timer
+    play.showTimer = $.clock.after(SHOW_AFTER_MS, guarded(() => onWorking($))) as Timer
     return next(e)
   })
 
@@ -670,9 +823,12 @@ export const register: Register = (on) => {
       // Claude is done but the video is not: let it play out while they read the answer.
       await setPhase($, 'grace')
       const left = Math.min(GRACE_MAX_MS, Math.max(0, current.durationMs - play.played) + 1000)
-      play.graceTimer = $.clock.after(left, async () => {
-        if ((await read($, phase)) === 'grace') await pause($)
-      }) as Timer
+      play.graceTimer = $.clock.after(
+        left,
+        guarded(async () => {
+          if ((await read($, phase)) === 'grace') await pause($)
+        }),
+      ) as Timer
     }
     void prefetch($)
     // Once: the fullscreen layout docks the pane beside the chat instead of above the prompt.
@@ -742,7 +898,7 @@ export const register: Register = (on) => {
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
     const current = await read($, ad)
     if (!current || (await read($, isPaused)) || (await read($, isAway)) || (await read($, phase)) !== 'playing') return next(e)
-    return next({ ...e, props: { ...e.props, message: `${current.spinnerText} · Sponsored` } })
+    return next({ ...e, props: { ...e.props, message: spinnerMessage(current.spinnerText, e.viewport?.columns) } })
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -756,6 +912,7 @@ export const register: Register = (on) => {
     const at = await read($, phase)
     const away = await read($, isAway)
     const width = Math.max(20, e.props.bodyColumns)
+    play.surface = e.surface
 
     // Pressed by a click in fullscreen, or by its key once the pane has focus (ctrl+x tab).
     // The pane's own ✕ closes it; no Hide or Skip that would only cut the ad short.
@@ -924,11 +1081,32 @@ export const register: Register = (on) => {
       )
     }
 
-    // Surfaces without a raster (desktop, editor) get the card without the picture.
+    // The desktop app draws an Svg: the frame is a JPEG inside one, with the progress bar in the
+    // same document under it, so the bar is always the video's width.
+    let picture = null
+    if (e.surface === 'desktop' && current.format === 'video' && play.desktop) {
+      const { Svg } = $.ui.resolve(e)
+      const filled = (Math.max(0, Math.min(1, play.played / current.durationMs)) * 640).toFixed(1)
+      picture = (
+        <Svg
+          key={VIDEO}
+          alt={`${current.advertiser} video`}
+          source={
+            `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="370" viewBox="0 0 640 370">` +
+            `<image width="640" height="360" href="data:image/jpeg;base64,${play.desktop.jpeg[play.frame % play.desktop.count]}"/>` +
+            `<rect y="360" width="640" height="10" fill="#888" fill-opacity="0.35"/>` +
+            `<rect y="360" width="${filled}" height="10" fill="${BAR_COLOR}"/>` +
+            `</svg>`
+          }
+        />
+      )
+    }
+
+    // Surfaces without a raster or a desktop pack (the editor, a text ad) get the card without the picture.
     return (
       <Box flexDirection="column" width={width}>
         {header(width)}
-        {bar(Math.max(10, width - CLOSE_MARK_COLUMNS))}
+        {picture ?? <Text wrap="truncate-end">{bar(Math.max(10, width - CLOSE_MARK_COLUMNS))}</Text>}
         <Box flexDirection="column" marginTop={1}>
           <Text bold>{current.headline}</Text>
           <Text dimColor>{current.body}</Text>

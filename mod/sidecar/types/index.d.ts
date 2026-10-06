@@ -15,6 +15,8 @@ export type ServedAd = {
   framesUrl: string | null
   /** Sharp PNG frames for terminals that draw images (Ghostty, kitty, iTerm2, WezTerm); may 404. */
   hdUrl?: string | null
+  /** JPEG frames for the Claude desktop app, drawn in an Svg; may 404. Absent from older servers. */
+  desktopUrl?: string | null
   durationMs: number
   /** What a completed view credits the viewer, in micro-dollars. */
   viewerMicros: number

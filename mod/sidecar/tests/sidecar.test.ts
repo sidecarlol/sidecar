@@ -65,6 +65,8 @@ test('a turn serves an ad and the spinner carries it, marked Sponsored', async (
   on('ui.status', async () => ({ value: undefined }) as never)
 
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  // Startup does its network work off the hook, so the session never waits on the server.
+  await clock.settle()
   expect(calls).toContain('POST /api/v1/devices')
   expect(calls).toContain('GET /api/v1/me')
 
@@ -389,7 +391,7 @@ test('the pane says it is paused while you are away', async ($, on) => {
 test('the footer hint reads Sidecar and whole cents', async ($, on) => {
   mock.store(on)
   mock.env(on, ENV)
-  mock.clock(on, { now: 1_000_000 })
+  const clock = mock.clock(on, { now: 1_000_000 })
   on('http.fetch', async (_$, e) => {
     const body = e.url.endsWith('/devices') ? { token: 'tok', deviceId: 'dev_1' } : { wallet: { ...WALLET, todayMicros: 10_200 } }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } } as never
@@ -408,6 +410,7 @@ test('the footer hint reads Sidecar and whole cents', async ($, on) => {
     return t.ui.resolve(e).Text({ children: 'hint' })
   })
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  await clock.settle()
   await $.ui.render({ component: 'PromptHint', surface: 'terminal', requestId: 'main', props: { isDraft: false, isWorking: false, hint: '? for shortcuts' } } as never)
   expect(tail).toBe('Sidecar · $0.01 today')
   // Nothing pinned as a status notice (that drew a warning sign and the name twice).
@@ -548,6 +551,101 @@ test('by default the pane shows the sharp PNG frames, and falls back to blocks w
   await ui.unmount()
   ui = await mount()
   expect(await ui.find({ type: 'Raster', key: 'video' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('in the desktop app the pane plays the JPEG frames in an Svg, with the bar inside it', async ($, on) => {
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  mock.store(on, { token: 't' })
+  mock.env(on, ENV_PANE)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const rgb = new Uint8Array(4 * 2 * 3 * 2).fill(200)
+  const pack = { width: 4, height: 2, fps: 10, count: 2, rgb: rgb.toBase64() }
+  const desktopIndex = { width: 640, height: 360, fps: 10, count: 2, parts: [1, 1] }
+  const desktopPart = (i: number) => ({ start: i, jpeg: [`/9j/AAAA${i === 0 ? 'A' : 'B'}`] })
+  const videoAd = { ...TEXT_AD, format: 'video', framesUrl: `${API}/frames`, hdUrl: `${API}/hd`, desktopUrl: `${API}/desktop`, durationMs: 30_000 }
+  const fetched: string[] = []
+  on('http.fetch', async (_$, e) => {
+    fetched.push(e.url)
+    const body = e.url.endsWith('/frames') ? pack : e.url.endsWith('/desktop') ? desktopIndex : e.url.includes('/desktop?part=') ? desktopPart(Number(e.url.split('part=')[1])) : e.url.endsWith('/ads/request') ? { ad: videoAd } : e.url.endsWith('/beat') ? { status: 'served' } : { wallet: WALLET }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } } as never
+  })
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  on('session.version', async () => ({ value: { version: '2.1.287', base: '2.1.287', builtAt: '' } }) as never)
+  on('ui.status', async () => ({ value: undefined }) as never)
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('ui.close', async () => ({ value: undefined }) as never)
+  let redraws = 0
+  on('ui.invalidate', async () => {
+    redraws++
+    return { value: undefined } as never
+  })
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: 'desktop' } as never)
+  await submit($, 'go', 't1')
+  await clock.advance(1000)
+  // The desktop app never needs the sharp terminal frames.
+  expect(fetched.some((u) => u.includes('/hd'))).toBe(false)
+  const mount = () =>
+    $.ui.mount({
+      plugin: 'sidecar',
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: 'sidecar',
+      props: { title: 'Sponsored', isFocused: false, bodyColumns: 60, placement: 'dock' },
+    } as never)
+  let ui = await mount()
+  const first = (await ui.find({ type: 'Svg' })) as { props: { source: string } } | undefined
+  expect(first?.props.source).toContain('data:image/jpeg;base64,/9j/AAAAA')
+  // The bar is drawn in the Svg, not as a row of text under it.
+  expect(first?.props.source).toContain(`fill="#d97757"`)
+  await ui.unmount()
+  // Each tick is a redraw that moves to the next frame.
+  const before = redraws
+  await clock.advance(250)
+  expect(redraws).toBeGreaterThan(before)
+  ui = await mount()
+  const next = (await ui.find({ type: 'Svg' })) as { props: { source: string } } | undefined
+  expect(next?.props.source).not.toBe(first?.props.source)
+  await ui.unmount()
+})
+
+test('a desktop frame that is not plain base64 JPEG is never put in the Svg', async ($, on) => {
+  on('prompt.submit', async (_$, e) => ({ text: e.text }))
+  mock.store(on, { token: 't' })
+  mock.env(on, ENV_PANE)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const rgb = new Uint8Array(4 * 2 * 3 * 2).fill(200)
+  const pack = { width: 4, height: 2, fps: 10, count: 2, rgb: rgb.toBase64() }
+  const desktopIndex = { width: 640, height: 360, fps: 10, count: 2, parts: [2] }
+  // The first frame closes the attribute and adds an element of its own.
+  const desktopPart = { start: 0, jpeg: ['/9j/AAAA"/><script>x</script><image href="', '/9j/AAAAB'] }
+  const videoAd = { ...TEXT_AD, format: 'video', framesUrl: `${API}/frames`, desktopUrl: `${API}/desktop`, durationMs: 30_000 }
+  on('http.fetch', async (_$, e) => {
+    const body = e.url.endsWith('/frames') ? pack : e.url.endsWith('/desktop') ? desktopIndex : e.url.includes('/desktop?part=') ? desktopPart : e.url.endsWith('/ads/request') ? { ad: videoAd } : e.url.endsWith('/beat') ? { status: 'served' } : { wallet: WALLET }
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(body) } } as never
+  })
+  on('session.start', async (_$, e) => ({ cwd: e.cwd }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  on('session.version', async () => ({ value: { version: '2.1.287', base: '2.1.287', builtAt: '' } }) as never)
+  on('ui.status', async () => ({ value: undefined }) as never)
+  on('turn.start', async (_$, e) => ({ turnId: e.turnId }))
+  on('ui.open', async () => ({ value: { isPlaced: true } }) as never)
+  on('ui.close', async () => ({ value: undefined }) as never)
+  on('ui.invalidate', async () => ({ value: undefined }) as never)
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: 'desktop' } as never)
+  await submit($, 'go', 't1')
+  await clock.advance(1000)
+  const ui = await $.ui.mount({
+    plugin: 'sidecar',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'sidecar',
+    props: { title: 'Sponsored', isFocused: false, bodyColumns: 60, placement: 'dock' },
+  } as never)
+  // The whole pack is refused: the pane shows the card, with no Svg at all.
+  expect(await ui.find({ type: 'Svg' })).toBeUndefined()
   await ui.unmount()
 })
 
