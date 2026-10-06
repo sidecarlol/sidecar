@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { LastView, Phase, ServedAd, Wallet } from '../types'
-import { cleanAd, cleanUrl, cleanWallet } from './text'
+import { clean, cleanAd, cleanUrl, cleanWallet } from './text'
 import { decodePack, fitGrid, frameCells, frameRgba, solidCells } from './video'
 import type { FramePack } from './video'
 
@@ -61,6 +61,48 @@ const isAway = atom({ plugin: 'sidecar', key: 'isAway' } as const, false)
 
 type Timer = { cancel: () => void } | (() => void) | undefined
 
+/**
+ * Where the video plays:
+ * - `pane`: Claude Code's own pane (real pixels where the terminal draws images, else blocks).
+ * - `panel`: the Sidecar panel extension in VS Code, beside the terminal, as real video.
+ *   VS Code's terminal draws no images, so there the panel is the only sharp picture.
+ */
+type Player = 'pane' | 'panel'
+
+/** A Sidecar panel found through its lock file in ~/.sidecar/panel (see vscode/README.md). */
+type Panel = { port: number; token: string; app: string }
+
+type PanelEvent = { type: 'closed' | 'activity' | 'pause-toggle' | 'clicked'; what?: string }
+
+/** What the panel answers each sync: what it shows and what the person did there. */
+type PanelStatus = {
+  open: boolean
+  visible: boolean
+  playing: boolean
+  /** Where its video is, in milliseconds. */
+  currentMs: number
+  docVisible: boolean
+  error: string | null
+  events: PanelEvent[]
+}
+
+/** A found panel is trusted this long before the lock files are read again. */
+const PANEL_RECHECK_MS = 20_000
+/** The panel hears the state this often while it is open; it closes itself after 8s without. */
+const PANEL_SYNC_MS = 1000
+/** The panel is on this machine: a call that has not answered by now means it is gone. */
+const PANEL_TIMEOUT_MS = 2000
+/** At most this many lock files are read: a window leaves one, and a folder of thousands is not a window. */
+const PANEL_MAX_LOCKS = 16
+/** The panel's Marketplace id, offered to VS Code users who do not have it. */
+const PANEL_EXTENSION = 'sidecarlol.sidecar-panel'
+const PANEL_EVENTS = ['closed', 'activity', 'pause-toggle', 'clicked']
+/**
+ * How long the panel may be on screen with an ad's video not started (a failed
+ * download, or a codec VS Code cannot decode) before the ad plays in the pane.
+ */
+const PANEL_START_MS = 15_000
+
 // Playback lives in module variables: a reload drops the timers with them.
 /** Production API origin. */
 const DEFAULT_API_BASE = 'https://sidecar.lol'
@@ -68,7 +110,7 @@ const DEFAULT_API_BASE = 'https://sidecar.lol'
 const play = {
   apiBase: DEFAULT_API_BASE,
   /** Settings come from the environment and the store, read once on first use. */
-  isConfigured: false,
+  configuring: null as Promise<void> | null,
   wantsPane: true,
   /**
    * Real pixels (an Image: Ghostty, kitty, iTerm2, WezTerm) unless the person
@@ -110,6 +152,28 @@ const play = {
   /** No registration is attempted before this clock time (a failure, or the network's install limit). */
   registerRetryAt: 0,
   registering: null as Promise<boolean> | null,
+  /** Where the next video plays: see Player. Chosen before each ad. */
+  player: 'pane' as Player,
+  /** The session runs in VS Code's terminal (and SIDECAR_VSCODE_PANEL is not `off`). */
+  isVsCode: false,
+  /** The session's directory, from session.start: it only picks the VS Code window and is never sent anywhere. */
+  cwd: '',
+  /** This session's name to the panel: one panel per Claude Code session. */
+  panelClient: '',
+  panel: null as Panel | null,
+  panelCheckedAt: 0,
+  isPanelShown: false,
+  isPanelSyncing: false,
+  panelTimer: undefined as Timer,
+  lastPanelSyncAt: 0,
+  lastPanelError: null as string | null,
+  isPanelOffered: false,
+  /** This load closed Claude Code's own pane for the panel (one opened before a reload stays open). */
+  isPaneClosedForPanel: false,
+  /** How long the panel has been on screen with the current ad's video not yet playing. */
+  panelWaitMs: 0,
+  /** Creatives whose video the panel could not start: they play in the pane from then on. */
+  panelFailed: new Set<string>(),
 }
 
 /** Cents from a cent up; a single view's fraction of a cent keeps four places. */
@@ -156,13 +220,19 @@ function stopTimer(timer: Timer): undefined {
  * Developers point at another server with SIDECAR_API_BASE and turn the pane
  * off with SIDECAR_VIDEO_PANE=off; `/sidecar pixels` is remembered.
  */
-async function configure($: EngineInterface) {
-  if (play.isConfigured) return
-  play.isConfigured = true
+function configure($: EngineInterface): Promise<void> {
+  // One read, shared: a second caller waits for the first one's answers rather than seeing the defaults.
+  play.configuring ??= readConfig($)
+  return play.configuring
+}
+
+async function readConfig($: EngineInterface) {
   const base = (await $.env.get('SIDECAR_API_BASE'))?.trim()
   play.apiBase = (base || DEFAULT_API_BASE).replace(/\/+$/, '')
   play.wantsPane = (await $.env.get('SIDECAR_VIDEO_PANE'))?.trim().toLowerCase() !== 'off'
   play.wantsPixels = (await $.store.get('videoQuality')) !== 'blocks'
+  play.isVsCode =
+    (await $.env.get('TERM_PROGRAM')) === 'vscode' && (await $.env.get('SIDECAR_VSCODE_PANEL'))?.trim().toLowerCase() !== 'off'
 }
 
 /** A fetch that gives up after `ms`: the host's own fetch has no timeout, and a hung server must not hold a hook or pile up beats. */
@@ -423,7 +493,9 @@ async function isWatching($: EngineInterface): Promise<boolean> {
 /** Opens the pane for a video; says whether it is on screen (a narrow terminal leaves it waiting). */
 async function placePane($: EngineInterface): Promise<boolean> {
   await configure($)
+  const player = await choosePlayer($)
   if (!play.wantsPane || play.isPaneClosedByPerson) return false
+  if (player === 'panel') return true
   if (play.paneOwner === 'person') return true
   const opened = await $.ui.open({ id: PANE, title: 'Sponsored', rows: 10, columns: 48 })
   if (opened.isPlaced) {
@@ -436,6 +508,272 @@ async function placePane($: EngineInterface): Promise<boolean> {
 }
 
 /**
+ * Picks where the next video plays, before each ad, so a panel installed, closed
+ * or gone mid-session is noticed: the Sidecar panel when this is VS Code's
+ * terminal and the panel answers, else Claude Code's own pane.
+ */
+async function choosePlayer($: EngineInterface): Promise<Player> {
+  await configure($)
+  const usePanel = play.isVsCode && play.surface === 'terminal' && (await findPanel($)) !== null
+  play.player = usePanel ? 'panel' : 'pane'
+  if (play.isVsCode && !usePanel) offerPanel($)
+  // The panel shows the ad: Claude Code's own pane would only repeat it. Closed whoever opened
+  // it, and once per load also when this module never knew (a pane survives a reload).
+  if (usePanel && (play.paneOwner || !play.isPaneClosedForPanel)) {
+    play.paneOwner = null
+    play.isPaneClosedForPanel = true
+    await $.ui.close({ id: PANE }).catch(() => null)
+  }
+  return play.player
+}
+
+/**
+ * The panel plays only an uploaded video file. An ad without one (an image or a
+ * carousel), or one the panel already failed to start, plays in Claude Code's own
+ * pane instead, as it would without the panel; the panel stops syncing so its
+ * status cannot speak for the pane. Says whether the ad has somewhere to play.
+ */
+async function fitPlayer($: EngineInterface, served: ServedAd): Promise<boolean> {
+  if (served.format !== 'video' || play.player !== 'panel') return true
+  if (served.videoUrl && !play.panelFailed.has(served.creativeId)) return true
+  return moveToPane($)
+}
+
+/** Claude Code's own pane takes the current ad over from the panel. Says whether the pane is on screen. */
+async function moveToPane($: EngineInterface): Promise<boolean> {
+  play.player = 'pane'
+  await closePanel($)
+  if (play.paneOwner) return true
+  const opened = await $.ui.open({ id: PANE, title: 'Sponsored', rows: 10, columns: 48 })
+  if (opened.isPlaced) {
+    play.paneOwner = 'us'
+    return true
+  }
+  await $.ui.close({ id: PANE })
+  return false
+}
+
+/** What a panel's lock file must hold before anything is sent to it: a real port and a plain token. */
+function readLock(text: string): { port: number; token: string; pid: number; startedAt: number } | null {
+  const lock = JSON.parse(text) as { port?: unknown; token?: unknown; pid?: unknown; startedAt?: unknown }
+  const { port, token, pid } = lock
+  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1024 || port > 65_535) return null
+  if (typeof token !== 'string' || !/^[0-9a-f]{32,128}$/.test(token)) return null
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return null
+  return { port, token, pid, startedAt: typeof lock.startedAt === 'number' ? lock.startedAt : 0 }
+}
+
+/**
+ * The Sidecar panel of the VS Code window this session runs in. Each window's
+ * panel writes ~/.sidecar/panel/<port>.json ({ port, token, pid, startedAt }); the
+ * one whose workspace folder holds this session's directory wins, the newest on
+ * a tie. Each is asked `/hello` first, and must answer as the Sidecar panel with
+ * the lock's own pid: a window closed uncleanly, whose port another program
+ * took, is skipped, so nothing is ever sent to a stranger.
+ */
+async function findPanel($: EngineInterface): Promise<Panel | null> {
+  const now = await $.clock.now()
+  if (play.panel && now - play.panelCheckedAt < PANEL_RECHECK_MS) return play.panel
+  play.panelCheckedAt = now
+  play.panel = null
+  const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE'))
+  const dir = home ? `${home}/.sidecar/panel` : ''
+  try {
+    if (!dir || !(await $.fs.exists(dir))) return null
+    let best: Panel | null = null
+    let bestScore = -1
+    const entries = (await $.fs.list(dir)).filter((entry) => entry.kind === 'file' && entry.name.endsWith('.json'))
+    for (const entry of entries.slice(0, PANEL_MAX_LOCKS)) {
+      try {
+        const lock = readLock(await $.fs.read(`${dir}/${entry.name}`))
+        if (!lock) continue
+        const res = await fetchWithin(
+          $,
+          `http://127.0.0.1:${lock.port}/hello`,
+          { headers: { 'x-sidecar-token': lock.token } },
+          PANEL_TIMEOUT_MS,
+        )
+        if (!res.ok) continue
+        const hello = JSON.parse(res.text) as { sidecarPanel?: unknown; pid?: unknown; app?: unknown; workspaceFolders?: unknown }
+        if (hello.sidecarPanel !== true || hello.pid !== lock.pid || !Array.isArray(hello.workspaceFolders)) continue
+        const folders = hello.workspaceFolders.filter((f): f is string => typeof f === 'string')
+        const match = Math.max(0, ...folders.filter((f) => play.cwd === f || play.cwd.startsWith(`${f}/`)).map((f) => f.length))
+        const score = match * 1e13 + lock.startedAt
+        if (score > bestScore) {
+          bestScore = score
+          best = { port: lock.port, token: lock.token, app: clean(hello.app, 40) || 'VS Code' }
+        }
+      } catch {
+        // A window that closed without cleaning up: its port no longer answers.
+      }
+    }
+    play.panel = best
+  } catch {
+    // No readable folder: no panel.
+  }
+  return play.panel
+}
+
+/** Once a session: in VS Code without the panel, say how to get sharp video ads. */
+function offerPanel($: EngineInterface) {
+  if (play.isPanelOffered) return
+  play.isPanelOffered = true
+  $.ui.toast(`Sidecar plays sharp video beside the terminal with its VS Code extension: code --install-extension ${PANEL_EXTENSION}`, {
+    timeoutMs: 12000,
+  })
+}
+
+/** What the panel said, held to its shape: a wrong type counts as "not playing", never as a reason to crash. */
+function readStatus(text: string): PanelStatus {
+  const raw = JSON.parse(text) as Record<string, unknown>
+  const events = Array.isArray(raw.events) ? raw.events : []
+  return {
+    open: raw.open === true,
+    visible: raw.visible === true,
+    playing: raw.playing === true,
+    currentMs: typeof raw.currentMs === 'number' && Number.isFinite(raw.currentMs) ? Math.max(0, raw.currentMs) : 0,
+    docVisible: raw.docVisible === true,
+    error: typeof raw.error === 'string' ? clean(raw.error, 200) : null,
+    events: events
+      .filter((e): e is PanelEvent => typeof e === 'object' && e !== null && PANEL_EVENTS.includes((e as PanelEvent).type))
+      .slice(0, 50)
+      .map((e) => ({ type: e.type })),
+  }
+}
+
+async function panelPost($: EngineInterface, panel: Panel, state: unknown): Promise<PanelStatus> {
+  const res = await fetchWithin(
+    $,
+    `http://127.0.0.1:${panel.port}/sync`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-sidecar-token': panel.token },
+      body: JSON.stringify({ client: play.panelClient, state }),
+    },
+    PANEL_TIMEOUT_MS,
+  )
+  if (!res.ok) throw new Error(`panel: HTTP ${res.status}`)
+  return readStatus(res.text)
+}
+
+/**
+ * Tells the panel what to show and reads back what it saw: whether it is open,
+ * visible and really playing (watch time counts only then), and what the
+ * person did there (closed it, pressed pause, clicked, moved the mouse).
+ * Only the ad's own (already cleaned) copy, the earnings figures and the play state
+ * go over: never the prompt, the directory or anything of the session.
+ */
+async function syncPanel($: EngineInterface) {
+  const panel = play.panel
+  // One sync at a time: a slow answer must not stack up behind the next tick.
+  if (!panel || play.isPanelSyncing) return
+  play.isPanelSyncing = true
+  try {
+    await syncPanelOnce($, panel)
+  } finally {
+    play.isPanelSyncing = false
+  }
+}
+
+async function syncPanelOnce($: EngineInterface, panel: Panel) {
+  const current = await read($, ad)
+  const w = await read($, wallet)
+  const video = current?.format === 'video' && current.videoUrl ? current : null
+  // Nothing to show and Claude is not working: give the screen back rather than an idle panel.
+  if (!video && !play.isTurnRunning) return closePanel($)
+  let status: PanelStatus
+  try {
+    status = await panelPost($, panel, {
+      show: true,
+      ad: video && {
+        impressionId: video.impressionId,
+        advertiser: video.advertiser,
+        headline: video.headline,
+        body: video.body,
+        ctaLabel: video.ctaLabel,
+        clickUrl: video.clickUrl,
+        videoUrl: video.videoUrl,
+        durationMs: video.durationMs,
+      },
+      earnText: video ? earnText(video, '') : '',
+      isWorking: play.isTurnRunning,
+      playedMs: Math.round(play.played),
+      phase: await read($, phase),
+      paused: await read($, isPaused),
+      away: await read($, isAway),
+      notice: await read($, notice),
+      wallet: w && { todayMicros: w.todayMicros, lifetimeMicros: w.lifetimeMicros, isClaimed: w.isClaimed, claimUrl: w.claimUrl },
+    })
+  } catch {
+    // The window closed or the panel was turned off: nothing counts, and the next ad looks again.
+    play.panel = null
+    play.isPanelShown = false
+    play.isVideoMounted = false
+    play.panelTimer = stopTimer(play.panelTimer)
+    return
+  }
+  play.isPanelShown = status.open
+  // Watch time counts only while the panel is on screen and its video really moves.
+  play.isVideoMounted = status.open && status.visible && status.docVisible && status.playing
+  // The count trails the picture by up to a sync: catch it up, never past real elapsed time
+  // (the server holds it to wall-clock time as well).
+  const syncedAt = await $.clock.now()
+  const isSeen = status.open && status.visible && status.docVisible && !(await read($, isAway))
+  if (video && isSeen && status.currentMs > play.played) {
+    play.played = Math.min(status.currentMs, play.played + Math.max(0, syncedAt - play.lastPanelSyncAt) + PANEL_SYNC_MS)
+  }
+  // On screen but still no picture: count it (a sync's worth at most, so a stale clock cannot jump it).
+  const isStuck = video && isSeen && !status.playing && play.played === 0 && (await read($, phase)) === 'playing'
+  if (isStuck) play.panelWaitMs += Math.min(Math.max(0, syncedAt - play.lastPanelSyncAt), 2 * PANEL_SYNC_MS)
+  play.lastPanelSyncAt = syncedAt
+  if (status.error !== play.lastPanelError) {
+    play.lastPanelError = status.error
+    if (status.error) $.ui.log(`sidecar panel: ${status.error}`, { to: 'debug' })
+  }
+  for (const event of status.events) await onPanelEvent($, event)
+  if (video && isStuck && play.panelWaitMs >= PANEL_START_MS) return giveUpOnPanel($, video)
+  // The picture reached its end: the ad is over, even if the count trails it by a beat.
+  const at = await read($, phase)
+  if (video && (at === 'playing' || at === 'grace') && !status.playing && status.currentMs >= video.durationMs - 1000) {
+    await finish($)
+  }
+}
+
+/** The panel never got the video going: this ad, and this creative from now on, play in the pane. */
+async function giveUpOnPanel($: EngineInterface, video: ServedAd) {
+  play.panelFailed.add(video.creativeId)
+  $.ui.log(`sidecar panel: no picture after ${PANEL_START_MS / 1000}s, playing in the pane`, { to: 'debug' })
+  if (!(await moveToPane($))) return endPlayback($, 'skipped')
+  await loadPack($, video)
+}
+
+async function onPanelEvent($: EngineInterface, event: PanelEvent) {
+  if (event.type === 'activity' || event.type === 'clicked') await markActive($)
+  if (event.type === 'pause-toggle') await setPaused($, !(await read($, isPaused)))
+  if (event.type === 'closed') {
+    // Its tab's close mark is "not now", as the pane's is: the spinner line only until `/sidecar`.
+    play.isPaneClosedByPerson = true
+    play.isPanelShown = false
+    play.isVideoMounted = false
+    play.panelTimer = stopTimer(play.panelTimer)
+    if ((await read($, ad))?.format === 'video') await endPlayback($, 'skipped')
+  }
+}
+
+async function showPanel($: EngineInterface) {
+  await syncPanel($)
+  if (play.panel) play.panelTimer ??= $.clock.every(PANEL_SYNC_MS, guarded(() => syncPanel($))) as Timer
+}
+
+async function closePanel($: EngineInterface) {
+  play.panelTimer = stopTimer(play.panelTimer)
+  if (!play.isPanelShown || !play.panel) return
+  play.isPanelShown = false
+  play.isVideoMounted = false
+  await panelPost($, play.panel, { show: false }).catch(() => null)
+}
+
+/**
  * Opens the pane as the person sends a prompt. A pane opened on their prompt is
  * placed at any width (above the prompt on the main screen, docked in
  * fullscreen); one opened later from a timer needs 144 columns. The ad fills it
@@ -444,6 +782,8 @@ async function placePane($: EngineInterface): Promise<boolean> {
 async function openPaneForPrompt($: EngineInterface) {
   try {
     await configure($)
+    // The VS Code panel opens with its ad, not on the prompt.
+    if ((await choosePlayer($)) === 'panel') return
     if (!play.wantsPane || play.isPaneClosedByPerson || play.paneOwner || (await read($, isPaused))) return
     const opened = await $.ui.open({ id: PANE, title: 'Sponsored', rows: 10, columns: 48 })
     if (opened.isPlaced) play.paneOwner = 'us'
@@ -454,6 +794,7 @@ async function openPaneForPrompt($: EngineInterface) {
 }
 
 async function closeOurPane($: EngineInterface) {
+  await closePanel($)
   if (play.paneOwner !== 'us') return
   play.paneOwner = null
   play.isVideoMounted = false
@@ -473,9 +814,14 @@ async function endPlayback($: EngineInterface, reason: 'complete' | 'skipped' | 
   // Nothing left to show and Claude is done: give the screen back rather than an empty pane.
   if (!play.isTurnRunning) await closeOurPane($)
   if (!current || reason === 'expired') return
+  await settle($, current, reason, Math.round(play.played))
+}
+
+/** Tells the server the ad ended and what was watched; the wallet and last view follow its answer. */
+async function settle($: EngineInterface, current: ServedAd, reason: 'complete' | 'skipped', played: number) {
   try {
     const done = (await api($, `/impressions/${current.impressionId}/complete`, {
-      playedMs: Math.round(play.played),
+      playedMs: played,
       reason,
       idleMs: idleMs(await $.clock.now()),
     })) as { creditedMicros: number; isCredited: boolean; wallet: Wallet }
@@ -604,34 +950,45 @@ async function startAd($: EngineInterface) {
   play.hd = null
   play.hdPending = null
   play.desktop = null
+  play.panelWaitMs = 0
   play.lastTickAt = await $.clock.now()
   await update($, playedMs, () => 0)
   await update($, ad, () => served)
   await setPhase($, 'playing')
+  if (!(await fitPlayer($, served))) return endPlayback($, 'skipped')
 
-  if (served.format === 'video' && served.framesUrl) {
-    try {
-      const text = await cachePack($, served.creativeId, served.framesUrl)
-      if (text) play.pack = decodePack(text)
-      // The sharp frames are bigger: the block pack starts the ad, and they take over once
-      // the terminal has shown an image (a terminal without images never downloads them).
-      if (served.desktopUrl && (await isSvgSurface($))) {
-        // The desktop app shows real frames in an Svg; the block pack is only for terminals.
-        play.desktop = await fetchDesktop($, served.creativeId, served.desktopUrl)
-      } else if (wantsImage() && served.hdUrl) {
-        if (play.isImageConfirmed) void loadHd($, served.creativeId, served.hdUrl)
-        else play.hdPending = { creativeId: served.creativeId, url: served.hdUrl }
-      }
-      $.ui.invalidate('ui.render')
-    } catch {
-      play.pack = null
-      play.hd = null
-      play.hdPending = null
-    }
+  if (served.format === 'video' && play.player === 'panel' && served.videoUrl) {
+    // The panel downloads and plays the video itself: no frame packs here.
+    await showPanel($)
+  } else if (served.format === 'video' && served.framesUrl) {
+    await loadPack($, served)
   } else {
     await closeOurPane($)
   }
   startPlaybackTimers($)
+}
+
+/** Loads a video ad's frames for the pane. */
+async function loadPack($: EngineInterface, served: ServedAd) {
+  if (!served.framesUrl) return
+  try {
+    const text = await cachePack($, served.creativeId, served.framesUrl)
+    if (text) play.pack = decodePack(text)
+    // The sharp frames are bigger: the block pack starts the ad, and they take over once
+    // the terminal has shown an image (a terminal without images never downloads them).
+    if (served.desktopUrl && (await isSvgSurface($))) {
+      // The desktop app shows real frames in an Svg; the block pack is only for terminals.
+      play.desktop = await fetchDesktop($, served.creativeId, served.desktopUrl)
+    } else if (wantsImage() && served.hdUrl) {
+      if (play.isImageConfirmed) void loadHd($, served.creativeId, served.hdUrl)
+      else play.hdPending = { creativeId: served.creativeId, url: served.hdUrl }
+    }
+    $.ui.invalidate('ui.render')
+  } catch {
+    play.pack = null
+    play.hd = null
+    play.hdPending = null
+  }
 }
 
 async function loadHd($: EngineInterface, creativeId: string, url: string) {
@@ -662,6 +1019,8 @@ async function resume($: EngineInterface) {
   const current = await read($, ad)
   if (!current) return startAd($)
   if (current.format === 'video' && !(await placePane($))) return endPlayback($, 'skipped')
+  if (!(await fitPlayer($, current))) return endPlayback($, 'skipped')
+  if (current.format === 'video' && play.player === 'panel') await showPanel($)
   play.lastTickAt = await $.clock.now()
   await setPhase($, 'playing')
   await beat($)
@@ -673,7 +1032,20 @@ async function resume($: EngineInterface) {
 async function onWorking($: EngineInterface) {
   if (!play.isTurnRunning) return
   const at = await read($, phase)
-  if (at === 'paused') return resume($)
+  if (at === 'paused') {
+    const parked = await read($, ad)
+    // The panel never resumes a video mid-way: the next turn starts a fresh ad from its first frame.
+    if (parked?.format === 'video' && play.player === 'panel') {
+      await endPlayback($, 'skipped')
+      return startAd($)
+    }
+    // A spinner-only ad parked from a turn without the pane gives way to a video once the pane or panel is up.
+    if (parked?.format === 'text' && play.wantsPane && !play.isPaneClosedByPerson && (play.paneOwner || play.player === 'panel')) {
+      await endPlayback($, 'skipped')
+      return startAd($)
+    }
+    return resume($)
+  }
   if (!(await read($, ad))) return startAd($)
 }
 
@@ -726,11 +1098,21 @@ async function setPaused($: EngineInterface, paused: boolean) {
 
 export const register: Register = (on) => {
   // A reload reads the environment and store again.
-  play.isConfigured = false
+  play.configuring = null
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     play.surface = e.surface
+    play.cwd = e.cwd
+    play.panelClient = `claude-${Math.random().toString(36).slice(2, 10)}`
+    // A reload drops the playback timers, but $.state keeps the last ad: left there it reads as
+    // playing forever and no new ad is asked for this session. Cleared at once; the server is
+    // told in the background, since nothing here waits on the network.
+    const stale = await read($, ad)
+    const stalePlayed = await read($, playedMs)
+    if (stale) await update($, ad, () => null)
+    await setPhase($, 'idle')
+    await update($, playedMs, () => 0)
     await $.command.register({
       name: 'sidecar',
       description: 'Sidecar ads: open the ad pane, or `pause`, `resume`, `link`, `wallet`, `pixels`, `blocks`',
@@ -743,6 +1125,7 @@ export const register: Register = (on) => {
     play.cacheDir = home ? `${home}/.cache/sidecar/frames` : ''
     // Nothing here waits on the network: a slow or hung server must never hold up the session starting.
     void guarded(async () => {
+      if (stale && (await ensureDevice($))) await settle($, stale, 'skipped', stalePlayed)
       if (await ensureDevice($)) await refreshWallet($)
       await prefetch($)
     })()
@@ -822,11 +1205,15 @@ export const register: Register = (on) => {
     } else if ((await read($, phase)) === 'playing') {
       // Claude is done but the video is not: let it play out while they read the answer.
       await setPhase($, 'grace')
-      const left = Math.min(GRACE_MAX_MS, Math.max(0, current.durationMs - play.played) + 1000)
+      // The panel reports its video's end itself, so it gets the whole grace window.
+      const left = play.player === 'panel' ? GRACE_MAX_MS : Math.min(GRACE_MAX_MS, Math.max(0, current.durationMs - play.played) + 1000)
       play.graceTimer = $.clock.after(
         left,
         guarded(async () => {
-          if ((await read($, phase)) === 'grace') await pause($)
+          if ((await read($, phase)) !== 'grace') return
+          // The panel settles what was watched rather than parking the ad for the next turn.
+          if (play.player === 'panel') await endPlayback($, 'complete')
+          else await pause($)
         }),
       ) as Timer
     }
@@ -835,6 +1222,16 @@ export const register: Register = (on) => {
     if (play.couldDock && !(await $.store.get('dockTipShown'))) {
       await $.store.set('dockTipShown', true)
       $.ui.toast('Tip: /tui fullscreen shows ads beside your chat', { timeoutMs: 8000 })
+    }
+    return next(e)
+  })
+
+  // Leaving Claude Code takes the VS Code panel with it (its own watchdog would, 8s later). A /clear or a
+  // resume goes on in the same process, so it keeps playing. Nothing here waits on the network: exits are quick.
+  on('session.end', async ($, e, next) => {
+    if (e.reason !== 'clear' && e.reason !== 'resume') {
+      stopPlaybackTimers()
+      await closePanel($).catch(() => null)
     }
     return next(e)
   })
@@ -890,6 +1287,10 @@ export const register: Register = (on) => {
       }
     }
     play.isPaneClosedByPerson = false
+    if ((await choosePlayer($)) === 'panel') {
+      if ((await read($, ad))?.format === 'video') await showPanel($)
+      return { text: `Sidecar: video ads play in the ${play.panel?.app ?? 'VS Code'} panel beside the terminal while Claude works.` }
+    }
     play.paneOwner = 'person'
     await $.ui.open({ id: PANE, title: 'Sponsored' })
     return { text: 'Sidecar pane opened.' }
@@ -913,6 +1314,16 @@ export const register: Register = (on) => {
     const away = await read($, isAway)
     const width = Math.max(20, e.props.bodyColumns)
     play.surface = e.surface
+
+    // Reopened while the VS Code panel plays the ads: one quiet line, never a second copy of the ad.
+    // Watch time follows the panel's reports, not this pane.
+    if (play.player === 'panel' && e.surface === 'terminal') {
+      return (
+        <Text dimColor>
+          Sidecar plays ads in the {play.panel?.app ?? 'VS Code'} panel{current ? ` · ${current.advertiser} · ${earnText(current, '')}` : ''}
+        </Text>
+      )
+    }
 
     // Pressed by a click in fullscreen, or by its key once the pane has focus (ctrl+x tab).
     // The pane's own ✕ closes it; no Hide or Skip that would only cut the ad short.

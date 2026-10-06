@@ -17,6 +17,8 @@ export type ServedAd = {
   hdUrl?: string | null
   /** JPEG frames for the Claude desktop app, drawn in an Svg; may 404. Absent from older servers. */
   desktopUrl?: string | null
+  /** The creative's video file, for the VS Code panel, which plays real video. Absent from older servers. */
+  videoUrl?: string | null
   durationMs: number
   /** What a completed view credits the viewer, in micro-dollars. */
   viewerMicros: number

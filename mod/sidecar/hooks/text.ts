@@ -51,6 +51,15 @@ export function cleanUrl(value: unknown, fallback = ''): string {
   return /^https?:\/\//i.test(url) && url.length <= MAX_URL ? url : fallback
 }
 
+/**
+ * The video's file URL, for the VS Code panel to download. Only the ad server's own media folder
+ * qualifies: a URL anywhere else is dropped, so the panel is never pointed at another host.
+ */
+export function cleanVideoUrl(value: unknown, apiBase: string): string | null {
+  const url = cleanUrl(value)
+  return url.startsWith(`${apiBase}/api/media/videos/`) ? url : null
+}
+
 /** The served ad with every text and URL field cleaned. A spinner line that cleans to nothing falls back to the headline, then the advertiser. */
 export function cleanAd(raw: ServedAd, home: string): ServedAd {
   const advertiser = clean(raw.advertiser, 80)
@@ -66,6 +75,7 @@ export function cleanAd(raw: ServedAd, home: string): ServedAd {
     framesUrl: raw.framesUrl == null ? null : cleanUrl(raw.framesUrl) || null,
     ...(raw.hdUrl == null ? {} : { hdUrl: cleanUrl(raw.hdUrl) || null }),
     ...(raw.desktopUrl == null ? {} : { desktopUrl: cleanUrl(raw.desktopUrl) || null }),
+    ...(raw.videoUrl == null ? {} : { videoUrl: cleanVideoUrl(raw.videoUrl, home) }),
   }
 }
 
