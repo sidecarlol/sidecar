@@ -113,6 +113,8 @@ const play = {
   apiBase: DEFAULT_API_BASE,
   /** Settings come from the environment and the store, read once on first use. */
   configuring: null as Promise<void> | null,
+  /** A `-p` run or the SDK: nobody is at the prompt, so no ad is ever asked for. */
+  isHeadless: false,
   wantsPane: true,
   /**
    * Real pixels (an Image: Ghostty, kitty, iTerm2, WezTerm) unless the person
@@ -971,7 +973,7 @@ async function finish($: EngineInterface) {
 }
 
 async function startAd($: EngineInterface) {
-  if (await read($, isPaused)) return
+  if (play.isHeadless || (await read($, isPaused))) return
   // Nobody to see it: ask for nothing until they are back.
   if (!(await checkPresence($))) return
   if (!(await ensureDevice($))) return
@@ -1102,6 +1104,18 @@ async function onWorking($: EngineInterface) {
   if (!(await read($, ad))) return startAd($)
 }
 
+/** `/sidecar` with no argument: the person asks for the pane (or the VS Code panel) back. Needs no network. */
+async function openForPerson($: EngineInterface) {
+  play.isPaneClosedByPerson = false
+  if ((await choosePlayer($)) === 'panel') {
+    if ((await read($, ad))?.format === 'video') await showPanel($)
+    return { text: `Sidecar: video ads play in the ${play.panel?.app ?? 'VS Code'} panel beside the terminal while Claude works.` }
+  }
+  play.paneOwner = 'person'
+  await $.ui.open({ id: PANE, title: 'Sponsored' })
+  return { text: 'Sidecar pane opened.' }
+}
+
 /** Notes the person's sign of life; coming back from away picks the ad up again. */
 async function markActive($: EngineInterface) {
   play.lastActiveAt = await $.clock.now()
@@ -1109,11 +1123,14 @@ async function markActive($: EngineInterface) {
   await update($, isAway, () => false)
   play.lastTickAt = play.lastActiveAt
   $.ui.invalidate('ui.render')
-  if (await read($, ad)) {
-    // Tell the server at once that the stretch from here counts again.
-    await beat($)
-  }
-  if (play.isTurnRunning && !(await read($, ad))) await onWorking($)
+  // The server is told in the background: a keystroke must never wait on a slow or hung ad server.
+  void guarded(async () => {
+    if (await read($, ad)) {
+      // Tell the server at once that the stretch from here counts again.
+      await beat($)
+    }
+    if (play.isTurnRunning && !(await read($, ad))) await onWorking($)
+  })()
 }
 
 /** Goes away once the person has been quiet too long; says whether they are present. */
@@ -1155,6 +1172,9 @@ export const register: Register = (on) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    play.isHeadless = e.isInteractive === false
+    // Nobody watches a `-p` run or an SDK session: no device, no ads, no timers.
+    if (play.isHeadless) return started
     play.surface = e.surface
     play.cwd = e.cwd
     play.panelClient = `claude-${Math.random().toString(36).slice(2, 10)}`
@@ -1329,25 +1349,19 @@ export const register: Register = (on) => {
       await setPaused($, false)
       return { text: 'Sidecar resumed. Ads play while Claude works.' }
     }
+    if (arg !== 'link' && arg !== 'wallet') {
+      if (arg) return { text: 'Usage: /sidecar [pause | resume | link | wallet | pixels | blocks]' }
+      return openForPerson($)
+    }
     const w = await refreshWallet($)
     if (!w) return { text: 'Sidecar could not reach the ad server.' }
     if (arg === 'link') {
       return { text: `Link this machine to your Sidecar account to get paid:\n${w.claimUrl}` }
     }
-    if (arg === 'wallet') {
-      const linkLine = w.isClaimed ? '' : `\nNot linked yet: ${w.claimUrl}`
-      return {
-        text: `Today ${usd(w.todayMicros)} · pending ${usd(w.pendingMicros)} · lifetime ${usd(w.lifetimeMicros)}${linkLine}`,
-      }
+    const linkLine = w.isClaimed ? '' : `\nNot linked yet: ${w.claimUrl}`
+    return {
+      text: `Today ${usd(w.todayMicros)} · pending ${usd(w.pendingMicros)} · lifetime ${usd(w.lifetimeMicros)}${linkLine}`,
     }
-    play.isPaneClosedByPerson = false
-    if ((await choosePlayer($)) === 'panel') {
-      if ((await read($, ad))?.format === 'video') await showPanel($)
-      return { text: `Sidecar: video ads play in the ${play.panel?.app ?? 'VS Code'} panel beside the terminal while Claude works.` }
-    }
-    play.paneOwner = 'person'
-    await $.ui.open({ id: PANE, title: 'Sponsored' })
-    return { text: 'Sidecar pane opened.' }
   })
 
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {

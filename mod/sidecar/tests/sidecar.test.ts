@@ -316,7 +316,8 @@ test('return: a keystroke resumes the ad at once and the server hears it', async
   const beatsBefore = rig.beats.length
 
   await ($ as any).prompt.edit({ origin: { kind: 'key' }, text: '', cursor: 0, start: 0, end: 0, inputText: 'w' } as never)
-  // A beat goes out right away saying the next stretch counts.
+  // A beat goes out right away, in the background so the keystroke never waits on it, saying the next stretch counts.
+  await clock.settle()
   expect(rig.beats.length).toBe(beatsBefore + 1)
   expect(rig.beats[rig.beats.length - 1]!.isWatching).toBe(true)
   expect(rig.beats[rig.beats.length - 1]!.idleMs).toBe(0)

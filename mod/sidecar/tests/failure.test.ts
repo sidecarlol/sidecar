@@ -416,3 +416,33 @@ test('429 on an ad request: no ad this turn, no "unreachable" notice, and the ne
   await turn($, clock, 't2')
   expect(api.count('POST /api/v1/ads/request')).toBe(2)
 })
+
+test('with the server down, /sidecar still opens the pane, and an unknown argument gets the usage line', async ($, on) => {
+  mock.store(on, { token: 't' })
+  mock.env(on, ENV)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  engineStubs(on)
+  const api = server(on, clock, () => 'hang')
+  await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+  // Startup's own wallet read is still hanging in the background; the command adds no call of its own.
+  await clock.settle()
+  const before = api.calls.length
+  const opened = await $.command.run({ command: 'sidecar', args: '', origin: { kind: 'composer' } } as never)
+  expect(opened.text).toContain('pane opened')
+  const unknown = await $.command.run({ command: 'sidecar', args: 'wat', origin: { kind: 'composer' } } as never)
+  expect(unknown.text).toContain('Usage: /sidecar')
+  expect(api.calls.length).toBe(before)
+})
+
+test('a -p run or SDK session registers nothing and asks for no ad', async ($, on) => {
+  mock.store(on, { token: 't' })
+  mock.env(on, ENV)
+  const clock = mock.clock(on, { now: 1_000_000 })
+  engineStubs(on)
+  const api = server(on, clock, (call) => (call === 'POST /api/v1/ads/request' ? { status: 200, body: { ad: TEXT_AD } } : { status: 200, body: { wallet: WALLET } }))
+  await $.session.start({ source: 'startup', cwd: '/tmp', surface: null, isInteractive: false } as never)
+  await clock.settle()
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await clock.advance(15_000)
+  expect(api.calls).toEqual([])
+})
