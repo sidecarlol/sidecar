@@ -39,6 +39,8 @@ const CLOSE_MARK_COLUMNS = 2
 const API_TIMEOUT_MS = 8000
 /** Frame packs are megabytes: a slow link gets longer. */
 const DOWNLOAD_TIMEOUT_MS = 30_000
+/** Swaps a terminal may turn down in a row before the pane gives up on images. */
+const IMAGE_DENIALS = 3
 /** After a failed registration the next attempt waits this long, so a down server or a spent install limit is not asked every turn. */
 const REGISTER_RETRY_MS = 5 * 60_000
 const REGISTER_LIMITED_RETRY_MS = 60 * 60_000
@@ -118,12 +120,14 @@ const play = {
    */
   wantsPixels: true,
   isImageRefused: false,
+  /** Swaps in a row that this terminal turned down: a few in a row mean it draws no images. */
+  imageDenials: 0,
   pack: null as FramePack | null,
   /** The sharp PNG frames, when the ad has them and the terminal draws images. */
   hd: null as HdPack | null,
   /** The current ad's sharp pack, fetched only once this terminal has shown an image. */
   hdPending: null as { creativeId: string; url: string } | null,
-  /** An Image swap went through: this terminal draws real pixels. */
+  /** An Image swap went through: this terminal draws real pixels. Kept in the store, so the next ad and session start sharp. */
   isImageConfirmed: false,
   /** The JPEG frames for the Claude desktop app, which draws them in an Svg. */
   desktop: null as DesktopPack | null,
@@ -231,6 +235,7 @@ async function readConfig($: EngineInterface) {
   play.apiBase = (base || DEFAULT_API_BASE).replace(/\/+$/, '')
   play.wantsPane = (await $.env.get('SIDECAR_VIDEO_PANE'))?.trim().toLowerCase() !== 'off'
   play.wantsPixels = (await $.store.get('videoQuality')) !== 'blocks'
+  play.isImageConfirmed = (await $.store.get('imageOk')) === true
   play.isVsCode =
     (await $.env.get('TERM_PROGRAM')) === 'vscode' && (await $.env.get('SIDECAR_VSCODE_PANEL'))?.trim().toLowerCase() !== 'off'
 }
@@ -333,7 +338,9 @@ async function registerDevice($: EngineInterface): Promise<boolean> {
 /** `blocks` is the block pack; `hd` the sharp pack's index; `hd.<i>` its parts. */
 function cachePath(creativeId: string, kind = 'blocks'): string {
   // `hd2`: the first sharp packs were single files over the 4 MiB limit and got cut off.
-  return `${play.cacheDir}/${creativeId.replace(/[^\w-]/g, '_')}${kind === 'blocks' ? '' : `.${kind.replace('hd', 'hd2')}`}.json`
+  // The server's origin leads the name: a pack from a local or preview server is never another server's.
+  const origin = play.apiBase.replace(/^https?:\/\//, '').replace(/[^\w-]/g, '_')
+  return `${play.cacheDir}/${origin}.${creativeId.replace(/[^\w-]/g, '_')}${kind === 'blocks' ? '' : `.${kind.replace('hd', 'hd2')}`}.json`
 }
 
 /** Downloads a frame pack (or a part of one) once; later plays read it from disk. */
@@ -351,17 +358,34 @@ type HdPack = { width: number; height: number; fps: number; count: number; png: 
 /**
  * Fetches a sharp pack: its index, then each part (each under the 4 MiB a
  * fetch or a file may hold), joined back into one list of PNG frames.
+ *
+ * The index is a few dozen bytes and always asked for: a pack that was made again
+ * (sharper, longer) has another index, and its parts are cached under that index's
+ * name, so an old copy on disk is never played in its place. Offline, the last index
+ * stands.
  */
 async function fetchHd($: EngineInterface, creativeId: string, url: string): Promise<HdPack | null> {
   try {
-    const indexText = await cachePack($, creativeId, url, 'hd')
+    const indexPath = cachePath(creativeId, 'hd')
+    let indexText: string | null = null
+    try {
+      const res = await fetchWithin($, url, undefined, DOWNLOAD_TIMEOUT_MS)
+      if (res.ok) {
+        indexText = res.text
+        if (play.cacheDir) await $.fs.write(indexPath, res.text)
+      }
+    } catch {
+      // Offline: the index from the last time, if any.
+    }
+    if (!indexText && play.cacheDir && (await $.fs.exists(indexPath))) indexText = await $.fs.read(indexPath)
     if (!indexText) return null
     const index = JSON.parse(indexText) as { width?: number; height?: number; fps?: number; count?: number; parts?: number[] }
     if (!index.width || !index.height || !Array.isArray(index.parts) || index.parts.length === 0) return null
+    const name = `${index.width}x${index.height}_${index.count}_${index.parts.join('-')}`
     const png: string[] = []
     for (let i = 0; i < index.parts.length; i++) {
       const sep = url.includes('?') ? '&' : '?'
-      const partText = await cachePack($, creativeId, `${url}${sep}part=${i}`, `hd.${i}`)
+      const partText = await cachePack($, creativeId, `${url}${sep}part=${i}`, `hd.${name}.${i}`)
       if (!partText) return null
       const part = JSON.parse(partText) as { start?: number; png?: string[] }
       if (part.start !== png.length || !Array.isArray(part.png)) return null
@@ -879,7 +903,11 @@ async function tick($: EngineInterface) {
     if (wantsImage()) {
       const shown = await $.ui.blit({ ...size, source: pictureSource(play.pack) })
       if (!('deny' in shown && shown.deny)) {
-        play.isImageConfirmed = true
+        play.imageDenials = 0
+        if (!play.isImageConfirmed) {
+          play.isImageConfirmed = true
+          await $.store.set('imageOk', true)
+        }
         // Real pixels work here: now the sharp frames are worth the download.
         if (play.hdPending && !play.hd) {
           const { creativeId, url } = play.hdPending
@@ -887,9 +915,11 @@ async function tick($: EngineInterface) {
           void loadHd($, creativeId, url)
         }
       }
-      if ('deny' in shown && shown.deny) {
-        // This terminal draws no images (or tmux is between): blocks from here on.
+      if ('deny' in shown && shown.deny && ++play.imageDenials >= IMAGE_DENIALS) {
+        // This terminal draws no images (a resize or a redraw in between refuses one swap, not three): blocks from here on.
         play.isImageRefused = true
+        play.isImageConfirmed = false
+        await $.store.set('imageOk', false)
         play.hd = null
         play.hdPending = null
         $.ui.invalidate('ui.render')
@@ -971,6 +1001,9 @@ async function startAd($: EngineInterface) {
 /** Loads a video ad's frames for the pane. */
 async function loadPack($: EngineInterface, served: ServedAd) {
   if (!served.framesUrl) return
+  // A terminal known to draw images starts the sharp download now, beside the block pack, and swaps to it when it lands.
+  const isSharpNow = wantsImage() && play.isImageConfirmed && !!served.hdUrl && !(served.desktopUrl && (await isSvgSurface($)))
+  if (isSharpNow) void loadHd($, served.creativeId, served.hdUrl!)
   try {
     const text = await cachePack($, served.creativeId, served.framesUrl)
     if (text) play.pack = decodePack(text)
@@ -980,8 +1013,7 @@ async function loadPack($: EngineInterface, served: ServedAd) {
       // The desktop app shows real frames in an Svg; the block pack is only for terminals.
       play.desktop = await fetchDesktop($, served.creativeId, served.desktopUrl)
     } else if (wantsImage() && served.hdUrl) {
-      if (play.isImageConfirmed) void loadHd($, served.creativeId, served.hdUrl)
-      else play.hdPending = { creativeId: served.creativeId, url: served.hdUrl }
+      if (!isSharpNow) play.hdPending = { creativeId: served.creativeId, url: served.hdUrl }
     }
     $.ui.invalidate('ui.render')
   } catch {

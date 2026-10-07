@@ -1,6 +1,6 @@
 {
   "name": "sidecar",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Sponsored spinner + video ad pane while Claude works; viewers earn a share of every winning bid.",
   "types": "./types/index.d.ts",
   "author": {
