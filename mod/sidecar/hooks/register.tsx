@@ -39,8 +39,12 @@ const CLOSE_MARK_COLUMNS = 2
 const API_TIMEOUT_MS = 8000
 /** Frame packs are megabytes: a slow link gets longer. */
 const DOWNLOAD_TIMEOUT_MS = 30_000
-/** Swaps a terminal may turn down in a row before the pane gives up on images. */
-const IMAGE_DENIALS = 3
+/**
+ * How long every swap must be turned down, with none taken, before the pane gives up on images.
+ * Counted in time, not swaps: at 10 fps a relayout (a resize, a hint line appearing) refuses several
+ * in a row, and that must never cost the person the sharp video.
+ */
+const IMAGE_REFUSE_MS = 5_000
 /** After a failed registration the next attempt waits this long, so a down server or a spent install limit is not asked every turn. */
 const REGISTER_RETRY_MS = 5 * 60_000
 const REGISTER_LIMITED_RETRY_MS = 60 * 60_000
@@ -122,8 +126,8 @@ const play = {
    */
   wantsPixels: true,
   isImageRefused: false,
-  /** Swaps in a row that this terminal turned down: a few in a row mean it draws no images. */
-  imageDenials: 0,
+  /** When this terminal began turning every swap down (null while swaps are taken). */
+  imageDeniedSince: null as number | null,
   pack: null as FramePack | null,
   /** The sharp PNG frames, when the ad has them and the terminal draws images. */
   hd: null as HdPack | null,
@@ -926,7 +930,7 @@ async function tick($: EngineInterface) {
     if (wantsImage()) {
       const shown = await $.ui.blit({ ...size, source: pictureSource(play.pack) })
       if (!('deny' in shown && shown.deny)) {
-        play.imageDenials = 0
+        play.imageDeniedSince = null
         if (!play.isImageConfirmed) {
           play.isImageConfirmed = true
           await $.store.set('imageOk', true)
@@ -938,8 +942,10 @@ async function tick($: EngineInterface) {
           void loadHd($, creativeId, url)
         }
       }
-      if ('deny' in shown && shown.deny && ++play.imageDenials >= IMAGE_DENIALS) {
-        // This terminal draws no images (a resize or a redraw in between refuses one swap, not three): blocks from here on.
+      if ('deny' in shown && shown.deny) play.imageDeniedSince ??= now
+      if (play.imageDeniedSince !== null && now - play.imageDeniedSince >= IMAGE_REFUSE_MS) {
+        // Seconds of refusals with none taken: this terminal draws no images, blocks from here on.
+        play.imageDeniedSince = null
         play.isImageRefused = true
         play.isImageConfirmed = false
         await $.store.set('imageOk', false)

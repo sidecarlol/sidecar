@@ -545,10 +545,10 @@ test('by default the pane shows the sharp PNG frames, and falls back to blocks w
   await clock.advance(300)
   expect(sources.some((s) => typeof (s as { png?: string })?.png === 'string')).toBe(true)
   await ui.unmount()
-  // A terminal without images refuses the swap: blocks from then on.
+  // A terminal without images refuses every swap for seconds: blocks from then on.
   refuse = true
   ui = await mount()
-  await clock.advance(300)
+  await clock.advance(5_500)
   await ui.unmount()
   ui = await mount()
   expect(await ui.find({ type: 'Raster', key: 'video' })).toBeDefined()

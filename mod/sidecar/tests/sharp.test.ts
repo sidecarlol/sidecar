@@ -135,20 +135,27 @@ test('with an image remembered from before, the sharp pack is asked for at the s
   expect(next.events).toHaveLength(0)
 })
 
-test('one refused swap does not end the sharp frames, three in a row do', async ($, on) => {
+test('refused swaps during a relayout never end the sharp frames; seconds of nothing but refusals do', async ($, on) => {
   const t = setup($, on, { imageOk: true })
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
   await submit($, 'go', 't1')
   await t.clock.advance(1000)
   const ui = await t.mount()
   await t.clock.advance(300)
+  // A relayout turns down every swap for two seconds (twenty frames), then they are taken again.
   t.refuse('resized')
-  await t.clock.advance(200)
+  await t.clock.advance(2000)
+  t.refuse('')
+  await t.clock.advance(500)
+  expect(t.kept.get('imageOk')).toBe(true)
+  // A second relayout starts the count over rather than adding to the first.
+  t.refuse('resized')
+  await t.clock.advance(4000)
   t.refuse('')
   await t.clock.advance(500)
   expect(t.kept.get('imageOk')).toBe(true)
   t.refuse('no placeholder images')
-  await t.clock.advance(1000)
+  await t.clock.advance(6000)
   expect(t.kept.get('imageOk')).toBe(false)
   await ui.unmount()
 })
