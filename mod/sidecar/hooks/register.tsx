@@ -1169,6 +1169,7 @@ export const register: Register = (on) => {
     await $.command.register({
       name: 'sidecar',
       description: 'Sidecar ads: open the ad pane, or `pause`, `resume`, `link`, `wallet`, `pixels`, `blocks`',
+      argumentHint: '[pause | resume | link | wallet | pixels | blocks]',
     })
     // Launching Claude Code is the person at the keyboard.
     play.lastActiveAt = await $.clock.now()
