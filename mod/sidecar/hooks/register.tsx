@@ -197,6 +197,27 @@ function earnText(current: ServedAd, suffix: string): string {
   return current.isHouse ? 'House ad, not paid' : `you earn ${usd(current.viewerMicros)}${suffix}`
 }
 
+/** Word-wraps `text` to `width` columns in at most `max` lines, the last cut with an ellipsis if the text runs on. */
+function wrapLines(text: string, width: number, max: number): string[] {
+  const lines: string[] = []
+  let line = ''
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const next = line ? `${line} ${word}` : word
+    if (next.length <= width || !line) {
+      line = next
+      continue
+    }
+    lines.push(line)
+    line = word
+  }
+  if (line) lines.push(line)
+  if (lines.length <= max) return lines.map((l) => (l.length > width ? `${l.slice(0, width - 1)}…` : l))
+  const kept = lines.slice(0, max)
+  const last = kept[max - 1]!
+  kept[max - 1] = `${last.slice(0, Math.max(1, width - 1)).trimEnd()}…`
+  return kept
+}
+
 /**
  * The spinner's line: the ad, then the Sponsored mark. An ad line can be 60 characters, more than the
  * row holds at 80 columns beside the time and tokens, and a wrapped spinner jumps the prompt around:
@@ -1486,14 +1507,18 @@ export const register: Register = (on) => {
 
       if (isBanner && !isStacked) {
         const side = Math.max(20, width - columns - 2)
+        // The body takes the rows the video has to spare beside the other four lines (video plus its bar).
+        const bodyLines = wrapLines(current.body, side, Math.min(3, Math.max(1, rows + 1 - 4)))
         return (
           <Box flexDirection="row">
             {video}
-            {/* Five lines, the video's height: no spacers, or the pane scrolls the buttons away. */}
+            {/* No taller than the video: no spacers, or the pane scrolls the buttons away. */}
             <Box flexDirection="column" marginLeft={2} width={side}>
               {header(side)}
               <Text bold wrap="truncate-end">{current.headline}</Text>
-              <Text dimColor wrap="truncate-end">{current.body}</Text>
+              {bodyLines.map((l, i) => (
+                <Text key={`body${i}`} dimColor wrap="truncate-end">{l}</Text>
+              ))}
               <Box>
                 <Box key="cta" hover={LINK_HOVER}>
                   <Link href={current.clickUrl} label={`${current.ctaLabel} →`} />
