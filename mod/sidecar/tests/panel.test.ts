@@ -148,7 +148,7 @@ test('a panel that is hidden or not playing earns nothing', async ($, on) => {
   expect(calls.beats.at(-1)?.playedMs).toBe(0)
 })
 
-test('closing the panel is "not now": the ad ends and the next turn asks for the spinner only', async ($, on) => {
+test('closing the panel skips that ad: the rest of the turn is spinner only, the next prompt brings video back', async ($, on) => {
   mock.store(on, { token: 't' })
   mock.env(on, ENV)
   const clock = mock.clock(on, { now: 1_000_000 })
@@ -171,9 +171,18 @@ test('closing the panel is "not now": the ad ends and the next turn asks for the
   await $.turn.complete({ turnId: 't1', answer: 'done' } as never)
   expect(calls.completes.at(-1)?.reason).toBe('skipped')
 
-  await submit($, 'again', 't2')
+  // A turn the person did not prompt (a schedule, a peer) keeps it closed.
+  await $.turn.start({ text: 'scheduled', turnId: 't2' })
   await clock.advance(600)
   expect(calls.requests.at(-1)?.placements).toEqual(['spinner'])
+  await $.turn.complete({ turnId: 't2', answer: 'done' } as never)
+  await clock.advance(31_000)
+
+  const asked = calls.requests.length
+  await submit($, 'again', 't3')
+  await clock.advance(600)
+  expect(calls.requests.length).toBe(asked + 1)
+  expect(calls.requests.at(-1)?.placements).toEqual(['spinner', 'pane'])
 })
 
 test('in VS Code without the panel, the pane plays as before and the extension is offered once', async ($, on) => {

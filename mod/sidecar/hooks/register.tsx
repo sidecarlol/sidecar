@@ -149,6 +149,7 @@ const play = {
   isTurnRunning: false,
   /** Who opened the pane: we close only the one we opened. */
   paneOwner: null as 'us' | 'person' | null,
+  /** The person closed the pane or panel (`skipForNow`); their next prompt clears it. */
   isPaneClosedByPerson: false,
   isVideoMounted: false,
   isPrefetching: false,
@@ -802,13 +803,17 @@ async function onPanelEvent($: EngineInterface, event: PanelEvent) {
   if (event.type === 'activity' || event.type === 'clicked') await markActive($)
   if (event.type === 'pause-toggle') await setPaused($, !(await read($, isPaused)))
   if (event.type === 'closed') {
-    // Its tab's close mark is "not now", as the pane's is: the spinner line only until `/sidecar`.
-    play.isPaneClosedByPerson = true
     play.isPanelShown = false
     play.isVideoMounted = false
     play.panelTimer = stopTimer(play.panelTimer)
-    if ((await read($, ad))?.format === 'video') await endPlayback($, 'skipped')
+    await skipForNow($)
   }
+}
+
+/** The person closed the pane or the panel: that ad ends, and the spinner line carries on until their next prompt. */
+async function skipForNow($: EngineInterface) {
+  play.isPaneClosedByPerson = true
+  if ((await read($, ad))?.format === 'video') await endPlayback($, 'skipped')
 }
 
 async function showPanel($: EngineInterface) {
@@ -1223,6 +1228,8 @@ export const register: Register = (on) => {
   on('prompt.submit', async ($, e, next) => {
     if (isPersonOrigin(e.origin)) {
       await markActive($)
+      // A close skips one ad, never the rest of the session: their next prompt brings the video back.
+      play.isPaneClosedByPerson = false
       await openPaneForPrompt($)
     }
     return next(e)
@@ -1321,11 +1328,7 @@ export const register: Register = (on) => {
       const byPerson = e.origin.kind === 'person'
       play.paneOwner = null
       play.isVideoMounted = false
-      if (byPerson) {
-        play.isPaneClosedByPerson = true
-        const current = await read($, ad)
-        if (current?.format === 'video') await endPlayback($, 'skipped')
-      }
+      if (byPerson) await skipForNow($)
     }
     return next(e)
   })
